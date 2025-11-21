@@ -1,0 +1,16 @@
+project:
+  data_dir: '/data/protein/enzymeMIL/dataset/'
+  model_dir: '/data/protein/enzymeMIL/models/'
+
+model:
+  instance_embedding_dim: 480
+  attention_hidden_dim: 320
+  classifier_hidden_dim: 320
+  dropout_rate: 0.2
+
+training:
+  epochs: 80
+  batch_size: 512
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  scheduler: 'CosineAnnealingLR'

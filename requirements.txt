@@ -1,0 +1,10 @@
+# enzyme-mil runtime dependencies.
+#   pip install -r requirements.txt
+#
+# torch, numpy and fair-esm are used by code/; DCTdomain additionally needs scipy and faiss.
+
+torch>=2.0
+numpy
+scipy
+fair-esm>=2.0
+faiss-cpu

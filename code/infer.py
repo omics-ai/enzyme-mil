@@ -137,7 +137,7 @@ def sigmoid_confidence(logits: np.ndarray, calls: np.ndarray) -> list[np.ndarray
     matrix is never duplicated, and ``torch.sigmoid`` keeps a strongly negative logit -- possible
     when an enzyme called nothing and kept its single best class -- from overflowing ``exp``.
     """
-    return [torch.sigmoid(torch.from_numpy(row[call])).numpy() for row, call in zip(logits, calls)]
+    return [torch.sigmoid(torch.from_numpy(row[call])).numpy() for row, call in zip(logits, calls, strict=True)]
 
 
 def maximum_separation(distances: np.ndarray) -> int:
@@ -195,7 +195,7 @@ def write_predictions(
     with path.open("w", newline="\n") as handle:
         writer = csv.writer(handle, lineterminator="\n")
         writer.writerow(header)
-        for position, (entry, row) in enumerate(zip(entries, calls)):
+        for position, (entry, row) in enumerate(zip(entries, calls, strict=True)):
             called = classes[row]
             record = [entry, ";".join(called), len(called)]
             if scores is not None:
@@ -224,9 +224,11 @@ def main() -> int:
     for path in (npz_path, checkpoint):
         if not path.is_file():
             raise SystemExit(f"no such file: {path}")
-    classes = np.load(Path(args.classes).expanduser().resolve(), allow_pickle=True).astype(str)
+    classes = np.load(Path(args.classes).expanduser().resolve(), allow_pickle=False).astype(str)
     if len(classes) != NUM_CLASSES:
         raise SystemExit(f"expected {NUM_CLASSES} EC classes, found {len(classes)}")
+    if args.batch_size < 1:
+        raise SystemExit("--batch-size must be at least one")
     destination = (
         Path(args.output).expanduser().resolve()
         if args.output
@@ -246,7 +248,9 @@ def main() -> int:
         calls = call_ec(logits)
         scores = sigmoid_confidence(logits, calls) if args.confscore else None
     else:
-        centroids = Path(args.centroids) if args.centroids else checkpoint.parent / "centroids.npy"
+        centroids = (
+            Path(args.centroids).expanduser().resolve() if args.centroids else checkpoint.parent / "centroids.npy"
+        )
         if not centroids.is_file():
             raise SystemExit(f"milcl_plus needs EC centroids; {centroids} not found (pass --centroids)")
         model, centers = load_milcl(str(checkpoint), str(centroids), device)

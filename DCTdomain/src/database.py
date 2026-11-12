@@ -2,6 +2,9 @@
 
 __author__ = "Ben Iovino"
 __date__ = "3/18/24"
+
+Modified from upstream mgtools/DCTdomain for enzyme-mil: ``yield_seqs`` no longer drops sequences
+from the final batch (see the comment there).
 """
 
 import datetime
@@ -162,15 +165,17 @@ class Database:
         if len(seqs) > 1 and curr_len > maxlen:
             last_seq = seqs.pop()
             yield seqs
+            seqs = [(last_seq[0], last_seq[1])]
 
-        # Yield unless there are no sequences selected from database
-        try:
-            yield [(last_seq[0], last_seq[1])]
-        except UnboundLocalError:
-            if seqs:  # Only one sequence in fasta/database
-                yield seqs
-            else:
-                print("No sequences to fingerprint!\n")
+        # Yield whatever is left, unless no sequences were selected from database.
+        # MODIFIED for enzyme-mil (not in upstream mgtools/DCTdomain): upstream yielded only the
+        # sequence carried over from the previous batch here, silently dropping every other
+        # sequence of a final batch that fit within maxlen. Batches that upstream yielded
+        # correctly are unchanged.
+        if seqs:
+            yield seqs
+        else:
+            print("No sequences to fingerprint!\n")
 
     def get_last_vid(self) -> int:
         """Returns the last fingerprint ID in the database.

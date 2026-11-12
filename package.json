@@ -1,0 +1,23 @@
+{
+  "private": true,
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "husky": "^9.1.7",
+    "lint-staged": "^17.6.0",
+    "prettier": "^3.9.10"
+  },
+  "scripts": {
+    "prepare": "husky",
+    "format": "prettier --write . --ignore-unknown && uv run ruff check --fix . && uv run ruff format .",
+    "format:check": "prettier --check . --ignore-unknown && uv run ruff check . && uv run ruff format --check ."
+  },
+  "lint-staged": {
+    "*.{json,md,yaml,yml,js,ts,html,css}": "prettier --write",
+    "*.{py,ipynb}": [
+      "uv run ruff check --fix",
+      "uv run ruff format"
+    ]
+  }
+}

@@ -28,7 +28,7 @@ All the datasets are available at [Zenodo](https://zenodo.org/records/22598911).
   - test set 2: `dataset/price.csv`
   - test set 3: `dataset/uniprot-all.csv`
   - test set 4: `dataset/uniprot-multi.csv`
-- sequence-simlirity constrained test sets
+- sequence-similarity constrained test sets
   - test set 5: `dataset/test70.csv`
   - test set 6: `dataset/test50.csv`
 
@@ -52,37 +52,50 @@ All the datasets are available at [Zenodo](https://zenodo.org/records/22598911).
 `milcl_plus` additionally needs `checkpoints/milcl_plus/centroids.npy`, the split100 EC centroids its projection is compared against;
 `infer.py` picks that up automatically from beside the checkpoint.
 
+Every enzyme gets between one and five EC numbers. The sigmoid models keep the single
+best-scoring EC when nothing reaches 0.5, so a `--confscore` value below 0.5 marks such a fallback call,
+and keep the five best when more than five do. CLEAN maximum separation calls one to five by construction.
+
 ## Install
 
+Dependencies are declared in `pyproject.toml` and pinned in `uv.lock`. With [uv](https://docs.astral.sh/uv/):
+
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
 
-DCTdomain is bundled in `DCTdomain/`. Compile its `RecCut` domain cutter once and `process.py` refuses to start without it:
+That creates `.venv/`. Run the commands below inside it: activate it with `source .venv/bin/activate`, or
+put `uv run` in front of each one. Without uv, `pip install --group dev` (pip 25.1 or newer) installs the
+same dependency list into the current environment, at whatever versions pip resolves.
+
+DCTdomain is bundled in `DCTdomain/`. Compile its `RecCut` domain cutter once; `process.py` refuses to start without it:
 
 ```bash
 cd DCTdomain
 g++ -o src/RecCut src/RecCut.cpp
 ```
 
-That is the whole setup. `process.py` runs DCTdomain in this same interpreter, so `requirements.txt`
+That is the whole setup. `process.py` runs DCTdomain in this same interpreter, so the one environment
 covers both: `torch`, `numpy` and `fair-esm` for the models, plus `scipy` and `faiss` for DCTdomain.
 (`faiss` only builds a similarity index nothing here reads, but DCTdomain imports it
 unconditionally. Conda users can `conda install -c conda-forge faiss` instead of `faiss-cpu`.)
 
-The first run downloads the ESM2 `esm2_t33_650M_UR50D` weights (2.6 GB) into the torch hub cache.
+The first run downloads two sets of ESM2 weights into the torch hub cache: `esm2_t33_650M_UR50D`
+(2.6 GB) for the whole-sequence embedding and `esm2_t30_150M_UR50D` (0.6 GB), which DCTdomain uses.
 
 ## Use
 
 **1. Build features.** Input is a tab-separated table with `Entry` and `Sequence`
 columns. An `EC number` column may be present and is ignored, so this works on unannotated proteins.
+Sequences need at least five residues, and an `Entry` cannot contain whitespace or `/`.
 
 ```bash
 cd code
 python process.py --csvdata ../example/example.csv
 ```
 
-Writes `../example/example.npz`. Useful flags: `--output` and `--device`.
+Writes `../example/example.npz`. Useful flags: `--output`, `--device` (where ESM2 runs) and
+`--dct-gpus` (GPUs for DCTdomain: one by default when CUDA is available, `0` for CPU).
 
 **2. Predict.**
 
@@ -92,16 +105,16 @@ python infer.py --npzdata ../example/example.npz \
                 --checkpoint ../checkpoints/milbc_plus/model_v1.pth
 ```
 
-Writes `../outputs/example_milbc_plus.csv` and prints a summary:
+Writes `../outputs/example_milbc_plus.csv` and prints a summary, with paths resolved to absolute ones:
 
 ```json
 {
   "model": "milbc_plus",
   "rule": "sigmoid 0.5",
-  "checkpoint": "../checkpoints/milbc_plus/model_v1.pth",
+  "checkpoint": "/path/to/enzyme-mil/checkpoints/milbc_plus/model_v1.pth",
   "enzymes": 10,
   "classes": 5242,
-  "output": "../outputs/example_milbc_plus.csv"
+  "output": "/path/to/enzyme-mil/outputs/example_milbc_plus.csv"
 }
 ```
 
@@ -112,7 +125,8 @@ A0A1B3PEJ0,2.7.8.7,1
 ```
 
 **3. Confidence scores (optional).** `--confscore` adds a `predicted_score` column with one score
-per called EC in the same order as `predicted_ec`:
+per called EC in the same order as `predicted_ec`: the sigmoid probability for `milbc` and `milbc_plus`
+(higher is more confident), the distance to the EC centroid for `milcl_plus` (lower is more confident):
 
 ```bash
 python infer.py --npzdata ../example/example.npz \
@@ -125,7 +139,7 @@ python infer.py --npzdata ../example/example.npz \
 
 ```text
 enzyme-mil/
-├── requirements.txt
+├── pyproject.toml, uv.lock      dependencies and their pinned versions
 ├── code/
 │   ├── models.py                architectures for all three checkpoints
 │   ├── process.py               sequences -> feature archive
@@ -135,8 +149,9 @@ enzyme-mil/
 │   ├── milbc/model_v1.pth
 │   ├── milbc_plus/model_v1.pth
 │   └── milcl_plus/model_v2.pt + centroids.npy
-├── DCTdomain/                   cloned from https://github.com/mgtools/DCTdomain;
-│                                compile src/RecCut before first use
+├── DCTdomain/                   src/ of https://github.com/mgtools/DCTdomain, with one fix in
+│                                src/database.py (marked there); compile src/RecCut before first use
+├── dataset/                     split100 training set and the six test sets
 ├── example/
 │   ├── example.csv              10 enzymes with sequences and true EC numbers
 │   └── example.npz              features file, ready for infer.py
@@ -145,14 +160,19 @@ enzyme-mil/
 
 ## Citation
 
-- **DCTdomain** — Iovino, Tang and Ye, _Genome Research_, 2024. <https://github.com/mgtools/DCTdomain>
+```text
+@article{xiao2026domain,
+  title={Domain-Aware Enzyme Classification via Multiple Instance Learning},
+  author={Xiao, Qingyang and Ye, Yuzhen and Tang, Haixu},
+  journal={Bioinformatics},
+  pages={btag804},
+  year={2026},
+  publisher={Oxford University Press}
+}
+```
+
+### other reference
+
+- **DCTdomain** — Iovino et al., _Genome Research_, 2024. <https://github.com/mgtools/DCTdomain>
 - **ESM2** — Lin et al., _Science_, 2023. <https://github.com/facebookresearch/ESM>
 - **CLEAN** max-separation — Yu et al., _Science_, 2023. <https://github.com/tttianhao/CLEAN>
-
----
-
-## pretrained models
-
-[CLEAN](https://github.com/tttianhao/CLEAN) shared pretrained model on [Google Drive](https://drive.google.com/file/d/1kwYd4VtzYuMvJMWXy6Vks91DSUAOcKpZ/view?usp=sharing)
-
-[EnzHier](https://github.com/labxscut/EnzHier) shared pretrained model on [GitHub](https://github.com/TangTZscut/EnzHier/blob/main/data/model/split100_triplet_withEC_7000.pth)

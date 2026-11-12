@@ -1,2 +1,4 @@
 __pycache__/
 DCTdomain/src/RecCut
+node_modules/
+.venv/

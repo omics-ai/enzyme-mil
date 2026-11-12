@@ -1,0 +1,38 @@
+[project]
+name = "enzyme-mil"
+version = "0.2.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false
+default-groups = ["dev"]
+
+[dependency-groups]
+# Needed by CI and the git hooks whichever stack you use.
+dev = [
+    "fair-esm==2.0.0",
+    "faiss-cpu==1.14.3",
+    "numpy",
+    "ruff",
+    "scipy",
+    "torch>=2.0"
+]
+
+[tool.ruff]
+line-length = 120
+# Honour these settings even when lint-staged passes explicit file paths.
+force-exclude = true
+
+[tool.ruff.lint]
+# Vendored third-party code: formatted with the rest, but not held to these lint rules.
+exclude = ["DCTdomain/**"]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "NPY", # NumPy-specific rules
+]
+# The formatter already wraps at line-length; E501 only fires on what it cannot split.
+ignore = ["E501"]

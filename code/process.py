@@ -24,16 +24,22 @@ unless ``--dct-python`` says otherwise. It needs its ``RecCut`` domain-cutter co
 
     cd DCTdomain && g++ -o src/RecCut src/RecCut.cpp
 
-``--dctdomain`` (or ``DCTDOMAIN_HOME``) points at a different clone. Already have fingerprints?
-``--dct-npz`` skips that step entirely.
+``--dctdomain`` (or ``DCTDOMAIN_HOME``) points at a different clone; note that a stock upstream
+clone lacks the bundled copy's fix for sequences dropped from the final batch. Already have
+fingerprints? ``--dct-npz`` skips that step entirely.
+
+``--device`` places the ESM2 embedding only. DCTdomain has its own ``--dct-gpus``, which always
+takes CUDA devices 0 to n-1 and defaults to one GPU when CUDA is available and to CPU otherwise.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -49,6 +55,8 @@ ESM_LAYER = 33
 ESM_MODEL = "esm2_t33_650M_UR50D"
 QUANTISATION = 128.0
 AMINO_ACIDS = set("ACDEFGHIKLMNPQRSTVWYBXZUO")
+# DCTdomain silently skips anything shorter: it cannot fill a 3 x 80 fingerprint from it.
+MIN_LENGTH = 5
 
 
 def find_dctdomain(explicit: str | None) -> Path:
@@ -102,14 +110,45 @@ def read_sequences(path: Path) -> list[tuple[str, str]]:
             raise SystemExit(f"{path} line {number}: empty Entry")
         if entry in seen:
             raise SystemExit(f"{path} line {number}: duplicate Entry {entry}")
+        # DCTdomain keeps only the first word of a FASTA header as the identifier and names a
+        # scratch file after it, so either of these loses the protein partway through the run.
+        if "/" in entry or any(character.isspace() for character in entry):
+            raise SystemExit(f"{path} line {number}: Entry {entry!r} must not contain whitespace or '/'")
         if not sequence:
             raise SystemExit(f"{path} line {number}: {entry} has no sequence")
         unknown = set(sequence) - AMINO_ACIDS
         if unknown:
             raise SystemExit(f"{path} line {number}: {entry} has non-amino-acid characters {sorted(unknown)}")
+        if len(sequence) < MIN_LENGTH:
+            raise SystemExit(
+                f"{path} line {number}: {entry} has {len(sequence)} residues; "
+                f"DCTdomain cannot fingerprint fewer than {MIN_LENGTH}"
+            )
         seen.add(entry)
         pairs.append((entry, sequence))
     return pairs
+
+
+def check_kept_database(database: Path, pairs: list[tuple[str, str]]) -> None:
+    """Refuse to resume a kept DCTdomain database built from different sequences.
+
+    DCTdomain resumes an existing database and never replaces a sequence it already holds, so
+    rerunning ``--keep-intermediate`` after editing a sequence would silently return the old
+    protein's fingerprints under the same Entry.
+    """
+    if not database.is_file():
+        return
+    try:
+        with contextlib.closing(sqlite3.connect(database)) as connection:
+            stored = dict(connection.execute("SELECT pid, sequence FROM sequences"))
+    except sqlite3.DatabaseError as error:
+        raise SystemExit(f"{database} is not a DCTdomain database ({error}); delete {database.parent}") from error
+    changed = [entry for entry, sequence in pairs if stored.get(entry, sequence) != sequence]
+    if changed:
+        raise SystemExit(
+            f"{database} was built from different sequences for {len(changed)} of {len(pairs)} "
+            f"proteins (first: {changed[0]}). Delete {database.parent} and rerun."
+        )
 
 
 def run_dctdomain(
@@ -122,11 +161,12 @@ def run_dctdomain(
     maxlen: int,
 ) -> Path:
     """Fingerprint every sequence and return the ``*.db-dct.npz`` DCTdomain writes."""
+    database = workdir / "sequences.db"
+    check_kept_database(database, pairs)
     fasta = workdir / "sequences.fasta"
     with fasta.open("w") as handle:
         for entry, sequence in pairs:
             handle.write(f">{entry}\n{sequence}\n")
-    database = workdir / "sequences.db"
     command = [
         interpreter,
         str(dctdomain / "src" / "make_db.py"),
@@ -146,12 +186,12 @@ def run_dctdomain(
     print(f"[1/2] DCTdomain fingerprints for {len(pairs)} sequences", flush=True)
     # Run from the work directory: DCTdomain writes per-sequence scratch files into the working
     # directory, and Python resolves its imports from the script's own directory regardless.
-    result = subprocess.run(command, cwd=workdir)
+    result = subprocess.run(command, cwd=workdir, check=False)
     if result.returncode != 0:
         raise SystemExit(
-            f"DCTdomain failed with exit code {result.returncode}. It needs torch, fair-esm, scipy "
-            f"and faiss in the interpreter running it ({interpreter}); see requirements.txt, or "
-            f"pass --dct-python to use a different one."
+            f"DCTdomain failed with exit code {result.returncode}; its own error is above. If that "
+            f"is an ImportError, it needs torch, fair-esm, scipy and faiss in the interpreter "
+            f"running it ({interpreter}): see pyproject.toml, or pass --dct-python."
         )
     fingerprints = database.with_name(database.name + "-dct.npz")
     if not fingerprints.is_file():
@@ -166,14 +206,27 @@ def read_fingerprints(path: Path) -> dict[str, np.ndarray]:
         if missing:
             raise SystemExit(f"{path} is missing {sorted(missing)}; is it a DCTdomain *-dct.npz?")
         identifiers, offsets, fingerprints = archive["sid"], archive["idx"], archive["dct"]
+    if len(identifiers) == 0:
+        # DCTdomain exits 0 even when its embedding worker died, leaving an empty archive.
+        raise SystemExit(f"{path} holds no fingerprints: DCTdomain fingerprinted nothing; its own error is above")
     if len(offsets) != len(identifiers) + 1:
         raise SystemExit(f"{path}: idx must hold one offset per sequence plus a final bound")
     if fingerprints.ndim != 2 or fingerprints.shape[1] != DOMAIN_DIM:
         raise SystemExit(f"{path}: expected {DOMAIN_DIM}-value fingerprints, found {fingerprints.shape}")
-    return {
-        str(identifier): fingerprints[offsets[position] : offsets[position + 1], :]
-        for position, identifier in enumerate(identifiers)
-    }
+    table: dict[str, np.ndarray] = {}
+    for position, identifier in enumerate(identifiers):
+        if str(identifier) in table:
+            # DCTdomain groups consecutive rows by protein; a repeat means they were interleaved.
+            raise SystemExit(f"{path}: the fingerprints of {identifier} are not contiguous")
+        table[str(identifier)] = fingerprints[offsets[position] : offsets[position + 1], :]
+    return table
+
+
+def check_coverage(pairs: list[tuple[str, str]], fingerprints: dict[str, np.ndarray], path: Path) -> None:
+    """Stop before the ESM2 step if DCTdomain left any protein without a fingerprint."""
+    missing = [entry for entry, _ in pairs if entry not in fingerprints]
+    if missing:
+        raise SystemExit(f"{path} has no fingerprint for {len(missing)} of {len(pairs)} proteins (first: {missing[0]})")
 
 
 def dct_to_representation(feature: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
@@ -186,8 +239,6 @@ def dct_to_representation(feature: np.ndarray) -> tuple[np.ndarray, np.ndarray, 
     dct_count = feature.shape[0] - 1
     representation = np.full((MAX_DOMAINS, 2 * DOMAIN_DIM), 0, dtype=float)
     mask = np.full((MAX_DOMAINS,), False, dtype=bool)
-    if dct_count > MAX_DOMAINS:
-        print(f"[warn] {dct_count} domains found; keeping the first {MAX_DOMAINS}", flush=True)
     if dct_count > 0:
         for position in range(min(dct_count, MAX_DOMAINS)):
             representation[position, :DOMAIN_DIM] = feature[position, :] / QUANTISATION
@@ -233,7 +284,8 @@ def embed_sequences(pairs: list[tuple[str, str]], device: str, batch_tokens: int
         print(f"      {done}/{len(pairs)} sequences", flush=True)
 
     for position in order:
-        longest = max(len(pairs[index][1]) for index in [*batch, position]) + 2
+        # Shortest-first, so the newcomer is the longest in the batch and sets its padded width.
+        longest = len(pairs[position][1]) + 2
         if batch and longest * (len(batch) + 1) > batch_tokens:
             flush(batch)
             batch = []
@@ -250,9 +302,9 @@ def build_samples(
     """One sample dict per protein, in input order."""
     samples = []
     for entry, _ in pairs:
-        if entry not in fingerprints:
-            raise SystemExit(f"DCTdomain returned no fingerprint for {entry}")
         representation, mask, dct_count = dct_to_representation(fingerprints[entry])
+        if dct_count > MAX_DOMAINS:
+            print(f"[warn] {entry}: {dct_count} domains found; keeping the first {MAX_DOMAINS}", flush=True)
         embedding = embeddings[entry]
         if embedding.shape != (ESM_DIM,):
             raise SystemExit(f"{entry}: ESM2 embedding is {embedding.shape}, expected ({ESM_DIM},)")
@@ -286,7 +338,9 @@ def main() -> int:
     parser.add_argument("--dct-npz", help="reuse an existing DCTdomain *-dct.npz instead of running it")
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-tokens", type=int, default=16384, help="ESM2 tokens per batch, padding included")
-    parser.add_argument("--dct-gpus", type=int, default=1, help="GPUs for DCTdomain embedding; 0 for CPU")
+    parser.add_argument(
+        "--dct-gpus", type=int, help="GPUs for DCTdomain embedding; 0 for CPU (default: 1 if CUDA is available)"
+    )
     parser.add_argument("--dct-cpus", type=int, default=4, help="CPU workers for DCT fingerprinting")
     parser.add_argument("--dct-maxlen", type=int, default=500, help="DCTdomain sequence-splitting threshold")
     parser.add_argument("--keep-intermediate", action="store_true", help="keep the FASTA and DCTdomain database")
@@ -296,33 +350,48 @@ def main() -> int:
     if not source.is_file():
         raise SystemExit(f"no such file: {source}")
     destination = Path(args.output).expanduser().resolve() if args.output else source.with_suffix(".npz")
+    if destination.suffix != ".npz":
+        # np.savez appends the suffix itself; do it here so the path reported below is the real one.
+        destination = destination.with_name(destination.name + ".npz")
     if args.batch_tokens < 1:
         raise SystemExit("--batch-tokens must be at least one")
+
+    device = args.device
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        print(f"[warn] {device} requested but CUDA is unavailable; using CPU")
+        device = "cpu"
+    available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    dct_gpus = min(available_gpus, 1) if args.dct_gpus is None else args.dct_gpus
+    if dct_gpus < 0:
+        raise SystemExit("--dct-gpus cannot be negative")
+    if dct_gpus > available_gpus:
+        print(f"[warn] --dct-gpus {dct_gpus} requested but only {available_gpus} CUDA device(s) found")
+        dct_gpus = available_gpus
 
     pairs = read_sequences(source)
     lengths = [len(sequence) for _, sequence in pairs]
     print(f"{len(pairs)} proteins from {source}, {min(lengths)}-{max(lengths)} residues")
 
-    if args.dct_npz:
-        fingerprint_path = Path(args.dct_npz).expanduser().resolve()
-        if not fingerprint_path.is_file():
-            raise SystemExit(f"no such file: {fingerprint_path}")
-        print(f"[1/2] reusing DCTdomain fingerprints from {fingerprint_path}")
-        workdir = None
-    else:
-        dctdomain = find_dctdomain(args.dctdomain)
-        if args.keep_intermediate:
-            workdir = destination.parent / f"{destination.stem}_dct"
-        else:
-            workdir = Path(tempfile.mkdtemp(prefix="enzyme-mil-dct-"))
-        workdir.mkdir(parents=True, exist_ok=True)
-        fingerprint_path = run_dctdomain(
-            pairs, workdir, dctdomain, args.dct_python, args.dct_gpus, args.dct_cpus, args.dct_maxlen
-        )
-
+    workdir = None
     try:
+        if args.dct_npz:
+            fingerprint_path = Path(args.dct_npz).expanduser().resolve()
+            if not fingerprint_path.is_file():
+                raise SystemExit(f"no such file: {fingerprint_path}")
+            print(f"[1/2] reusing DCTdomain fingerprints from {fingerprint_path}")
+        else:
+            dctdomain = find_dctdomain(args.dctdomain)
+            if args.keep_intermediate:
+                workdir = destination.parent / f"{destination.stem}_dct"
+                workdir.mkdir(parents=True, exist_ok=True)
+            else:
+                workdir = Path(tempfile.mkdtemp(prefix="enzyme-mil-dct-"))
+            fingerprint_path = run_dctdomain(
+                pairs, workdir, dctdomain, args.dct_python, dct_gpus, args.dct_cpus, args.dct_maxlen
+            )
         fingerprints = read_fingerprints(fingerprint_path)
-        embeddings = embed_sequences(pairs, args.device, args.batch_tokens)
+        check_coverage(pairs, fingerprints, fingerprint_path)
+        embeddings = embed_sequences(pairs, device, args.batch_tokens)
         samples = build_samples(pairs, fingerprints, embeddings)
     finally:
         if workdir is not None and not args.keep_intermediate:

@@ -221,7 +221,7 @@ def load_milbc(checkpoint: str, with_esm: bool, device: str = "cpu") -> Attentio
 def load_milcl(checkpoint: str, centroids: str, device: str = "cpu") -> tuple[JointMILCL, np.ndarray]:
     """Rebuild ``milcl_plus`` and read the EC centroids max-separation scores against."""
     model = JointMILCL()
-    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
     model.load_state_dict(payload["model_state"])
     centers = np.load(centroids, allow_pickle=False)
     if centers.shape != (NUM_CLASSES, MILCL_CONFIG["projection_dim"]):

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Fail if uv.lock is stale. Set here rather than as a --locked flag so it also
+  # covers the nested `uv run ruff` calls inside `npm run format:check`.
+  UV_LOCKED: '1'
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      # Reads .python-version and installs that interpreter itself.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+
+      - name: Install formatters
+        run: npm ci --ignore-scripts
+
+      - name: Check Prettier and Ruff formatting
+        run: npm run format:check
